@@ -705,9 +705,6 @@ void UpdatePathRecording()
     if (pathMineRecordStage == PathMineRecordStage.StartSet || pathMineRecordStage == PathMineRecordStage.CornerASet)
         gyros.FaceVectors(pathMineSavedForward, pathMineSavedUp);
 
-    if (pathMineRecordStage == PathMineRecordStage.CornerASet)
-        EnforcePathMineCornerBounds();
-
     if (pathMineRecordStage == PathMineRecordStage.ReturningToStart)
     {
         if (IsAtTargetPose(pathMineStartPos, pathMineSavedForward, pathMineSavedUp))
@@ -790,7 +787,7 @@ void StepPathMineRecording()
 
     if (pathMineRecordStage == PathMineRecordStage.CornerASet)
     {
-        Vector3D cornerB = rc.GetPosition();
+        Vector3D cornerB = ConstrainPathMineCornerPoint(rc.GetPosition());
         string line = string.Format(
             "GPS:Corner A{0}:{1:0.00}:{2:0.00}:{3:0.00}:#FF75C9F1:;GPS:Corner B{0}:{4:0.00}:{5:0.00}:{6:0.00}:#FF75C9F1:;{7:0.0000},{8:0.0000},{9:0.0000},{10:0.0000},{11:0.0000},{12:0.0000};{13:0.##}",
             pathRecordMineIndex,
@@ -822,7 +819,7 @@ void StepPathMineRecording()
     Echo("Mine record is returning to start. Please wait.");
 }
 
-void EnforcePathMineCornerBounds()
+Vector3D ConstrainPathMineCornerPoint(Vector3D point)
 {
     Vector3D up = pathMineSavedUp;
     Vector3D forward = pathMineSavedForward;
@@ -831,37 +828,16 @@ void EnforcePathMineCornerBounds()
         right = rc.WorldMatrix.Right;
     right = Vector3D.Normalize(right);
 
-    Vector3D p = rc.GetPosition();
-    Vector3D d = p - pathMineCornerA;
-    double f = Vector3D.Dot(d, forward); // lock fwd/back near corner-A plane
-    double u = Vector3D.Dot(d, up);      // disallow above corner A (positive up)
-    double r = Vector3D.Dot(d, right);   // disallow left of corner A (negative right)
+    Vector3D d = point - pathMineCornerA;
+    double f = Vector3D.Dot(d, forward); // lock fwd/back to Corner A plane
+    double u = Vector3D.Dot(d, up);      // disallow above corner A
+    double r = Vector3D.Dot(d, right);   // disallow left of corner A
 
-    const double tol = 0.15;
-    Vector3D correction = Vector3D.Zero;
+    double clampedF = 0;
+    double clampedU = Math.Min(0, u);
+    double clampedR = Math.Max(0, r);
 
-    if (Math.Abs(f) > tol)
-        correction += -forward * f;
-    if (u > tol)
-        correction += -up * u;
-    if (r < -tol)
-        correction += right * (-r);
-
-    if (correction.LengthSquared() > 0.1 * 0.1)
-    {
-        targetPosition = p + correction;
-        desiredUp = pathMineSavedUp;
-        desiredForward = pathMineSavedForward;
-        hasTarget = true;
-        autopilotEnabled = true;
-        activeMaxSpeed = Math.Min(2.0, SPEEDB);
-    }
-    else if (autopilotEnabled)
-    {
-        hasTarget = false;
-        autopilotEnabled = false;
-        activeMaxSpeed = 0;
-    }
+    return pathMineCornerA + forward * clampedF + up * clampedU + right * clampedR;
 }
 
 bool AppendPathRecordLine(string line)
