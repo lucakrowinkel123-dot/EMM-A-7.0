@@ -1231,13 +1231,14 @@ List<T> GetBlocks<T> (bool useSubgrids = false) where T : class, IMyTerminalBloc
     return blocks;
 }
 
-const double gyroP = 18;
+const double gyroP = 10;
 const double gyroI = 0;
-const double gyroD = 3;
+const double gyroD = 5;
 const double gyroMax = 1000;
 const double gyroErrorDeadbandRad = 0.003; // ~0.17 deg
 const double gyroOutputDeadband = 0.002;
 const double gyroFineDampRangeRad = 0.12; // start damping under ~7 deg total error
+const double gyroRateLimit = 0.35; // max per-axis command (rad/s equivalent)
 
 class GyroControl
 {
@@ -1401,6 +1402,10 @@ class GyroControl
             angles.Y = 0;
         if (Math.Abs(angles.Z) < gyroOutputDeadband)
             angles.Z = 0;
+
+        angles.X = MathHelper.Clamp(angles.X, -gyroRateLimit, gyroRateLimit);
+        angles.Y = MathHelper.Clamp(angles.Y, -gyroRateLimit, gyroRateLimit);
+        angles.Z = MathHelper.Clamp(angles.Z, -gyroRateLimit, gyroRateLimit);
     }
     void ApplyGyroOverride (MatrixD current, Vector3D localAngles)
     {
