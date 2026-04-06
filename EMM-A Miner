@@ -1,5 +1,5 @@
 
-// Autopilot Test Script
+// Autopilot Script
 
 // ============= Settings ==============
 // Edit these settings directly in the script.
@@ -149,7 +149,7 @@ public void Main (string argument, UpdateType updateSource)
 void WriteEcho()
 {
     StringBuilder sb = new StringBuilder();
-    sb.AppendLine("Autopilot Test Mode");
+    sb.AppendLine("Autopilot Mode");
     sb.AppendLine(autopilotEnabled ? "State: Enabled" : "State: Disabled");
     if (hasTarget)
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
