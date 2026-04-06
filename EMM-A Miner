@@ -833,18 +833,23 @@ void EnforcePathMineCornerBounds()
 
     Vector3D p = rc.GetPosition();
     Vector3D d = p - pathMineCornerA;
-    double f = Vector3D.Dot(d, forward); // disallow fwd/back motion
-    double u = Vector3D.Dot(d, up);      // disallow above corner A
-    double r = Vector3D.Dot(d, right);   // disallow left of corner A
+    double f = Vector3D.Dot(d, forward); // lock fwd/back near corner-A plane
+    double u = Vector3D.Dot(d, up);      // disallow above corner A (positive up)
+    double r = Vector3D.Dot(d, right);   // disallow left of corner A (negative right)
 
-    double clampedF = 0;
-    double clampedU = Math.Min(0, u);
-    double clampedR = Math.Max(0, r);
+    const double tol = 0.15;
+    Vector3D correction = Vector3D.Zero;
 
-    Vector3D allowed = pathMineCornerA + forward * clampedF + up * clampedU + right * clampedR;
-    if (Vector3D.DistanceSquared(p, allowed) > 0.25 * 0.25)
+    if (Math.Abs(f) > tol)
+        correction += -forward * f;
+    if (u > tol)
+        correction += -up * u;
+    if (r < -tol)
+        correction += right * (-r);
+
+    if (correction.LengthSquared() > 0.1 * 0.1)
     {
-        targetPosition = allowed;
+        targetPosition = p + correction;
         desiredUp = pathMineSavedUp;
         desiredForward = pathMineSavedForward;
         hasTarget = true;
