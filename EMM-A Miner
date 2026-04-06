@@ -689,7 +689,7 @@ void StartAreaMining(string command)
     Vector3D rightBottom;
     if (!TryParsePoint(args[1], out leftUpper) || !TryParsePoint(args[2], out rightBottom))
     {
-        Echo("Invalid rectangle points. Use GPS:Name:X:Y:Z: or x,y,z");
+        Echo("Invalid orientation mode. Use Faceup,Faceforward or ux,uy,uz,fx,fy,fz");
         return;
     }
 
