@@ -6,8 +6,8 @@
 // =====================================
 
 // ============= Commands ==============
-// GPS:Name:X:Y:Z:|Ux,Uy,Uz,Fx,Fy,Fz : sets target position and explicit up/forward vectors
-// GPS:Name:X:Y:Z:|Faceup,Faceforward : auto derive up/forward vectors
+// Nav;GPS:Name:X:Y:Z:|Ux,Uy,Uz,Fx,Fy,Fz : sets target position and explicit up/forward vectors
+// Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward : auto derive up/forward vectors
 // stop : disables autopilot and releases controls
 // start : enables autopilot (if a target has been set)
 // clear : clears target and releases controls
@@ -156,7 +156,7 @@ void WriteEcho()
     else
         sb.AppendLine("Target: <none>");
     sb.AppendLine("Command example:");
-    sb.AppendLine("GPS:Site:66288.47:-8270.96:-94039.68:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
+    sb.AppendLine("Nav;GPS:Site:66288.47:-8270.96:-94039.68:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
     sb.AppendLine("dumpgps");
     sb.AppendLine($"Arrival tolerance: {arrivalTolerance:0.00} m");
     sb.AppendLine($"Orientation tolerance: {orientationToleranceDeg:0.00} deg");
@@ -246,11 +246,12 @@ void RemoteCommand (string command)
         return;
 
     string trimmed = command.Trim();
-    if (trimmed.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+    if (trimmed.StartsWith("Nav;", StringComparison.OrdinalIgnoreCase))
     {
-        if (!TryParseGpsCommand(trimmed, out targetPosition, out desiredForward, out desiredUp))
+        string navArgs = trimmed.Substring(4).Trim();
+        if (!TryParseGpsCommand(navArgs, out targetPosition, out desiredForward, out desiredUp))
         {
-            Echo("Invalid GPS command format.");
+            Echo("Invalid Nav command format. Use Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward");
             return;
         }
         hasTarget = true;
