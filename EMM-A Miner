@@ -17,6 +17,8 @@
 // nexthole : skip to the next generated area lane anchor
 // cancelmine : stops mining state machine and turns drills off
 // pathstart : loads records from timer with tag in pathTimerTag and executes row-by-row
+// pathpause : pauses queue and active movement; minearea returns to current anchor and waits
+// pathcontinue : resumes queue advancement after pathpause
 // pathstop : stops path mode and clears remaining queued records
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
@@ -84,6 +86,8 @@ List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
 bool retryCurrentLane = false;
 bool pathMode = false;
+bool pathPaused = false;
+bool pathPausedNavResume = false;
 List<string> pathRecords = new List<string>();
 int pathIndex = 0;
 Vector3D stuckSamplePos = Vector3D.Zero;
@@ -177,7 +181,7 @@ void WriteEcho()
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
     if (pathMode)
-        sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}");
+        sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
     sb.AppendLine("Faceforward = look toward target");
     sb.AppendLine("Faceup = align up to gravity-up (or current up in space)");
 
@@ -375,6 +379,8 @@ void RemoteCommand (string command)
             areaLaneIndex = 0;
             retryCurrentLane = false;
             pathMode = false;
+            pathPaused = false;
+            pathPausedNavResume = false;
             pathRecords.Clear();
             pathIndex = 0;
             activeMaxSpeed = 0;
@@ -402,8 +408,54 @@ void RemoteCommand (string command)
         case "pathstart":
             StartPathFromTimer();
             break;
+        case "pathpause":
+            if (!pathMode)
+                Echo("Path mode is not active.");
+            else
+            {
+                pathPaused = true;
+                if (miningEnabled)
+                {
+                    SetDrills(false);
+                    retryCurrentLane = true;
+                    miningState = MiningState.Backout;
+                    autopilotEnabled = true; // return to anchor
+                    Echo("Path mode paused. Returning to current anchor.");
+                }
+                else if (autopilotEnabled && hasTarget)
+                {
+                    autopilotEnabled = false; // freeze movement in place
+                    pathPausedNavResume = true;
+                    Echo("Path mode paused. Movement halted.");
+                }
+                else
+                {
+                    Echo("Path mode paused.");
+                }
+            }
+            break;
+        case "pathcontinue":
+            if (!pathMode)
+                Echo("Path mode is not active.");
+            else
+            {
+                pathPaused = false;
+                Echo("Path mode resumed.");
+                if (miningEnabled && hasTarget)
+                    autopilotEnabled = true;
+                else if (pathPausedNavResume && hasTarget)
+                {
+                    autopilotEnabled = true;
+                    pathPausedNavResume = false;
+                }
+                else if (!autopilotEnabled && !miningEnabled)
+                    StartNextPathRecord();
+            }
+            break;
         case "pathstop":
             pathMode = false;
+            pathPaused = false;
+            pathPausedNavResume = false;
             pathRecords.Clear();
             pathIndex = 0;
             Echo("Path mode stopped.");
@@ -426,6 +478,8 @@ void RemoteCommand (string command)
 void UpdatePathRunner()
 {
     if (!pathMode || pathRecords.Count == 0)
+        return;
+    if (pathPaused)
         return;
 
     if (miningEnabled)
@@ -458,6 +512,8 @@ void StartPathFromTimer()
     pathRecords = loaded;
     pathIndex = 0;
     pathMode = true;
+    pathPaused = false;
+    pathPausedNavResume = false;
     Echo($"Loaded {pathRecords.Count} path records from timer '{timerName}'.");
     StartNextPathRecord();
 }
@@ -856,6 +912,12 @@ void UpdateMiningState()
             {
                 if (!retryCurrentLane)
                     SetDrills(false);
+                if (pathMode && pathPaused)
+                {
+                    autopilotEnabled = false;
+                    activeMaxSpeed = 0;
+                    return;
+                }
                 if (retryCurrentLane)
                 {
                     retryCurrentLane = false;
