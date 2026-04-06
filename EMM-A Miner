@@ -16,6 +16,8 @@
 // minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth : run distributed lanes over rectangle
 // nexthole : skip to the next generated area lane anchor
 // cancelmine : stops mining state machine and turns drills off
+// pathstart : loads records from timer with tag in pathTimerTag and executes row-by-row
+// pathstop : stops path mode and clears remaining queued records
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
@@ -36,6 +38,7 @@ double autoDepthExtraCap = 2000.0;
 double TOFFR = 0; // target offset Right (m)
 double TOFFU = -2.5; // target offset Up (m)
 double TOFFF = 0; // target offset Forward (m)
+string pathTimerTag = "Path";
 // =============================================
 
 IMyShipController rc;
@@ -80,6 +83,9 @@ bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
 bool retryCurrentLane = false;
+bool pathMode = false;
+List<string> pathRecords = new List<string>();
+int pathIndex = 0;
 Vector3D stuckSamplePos = Vector3D.Zero;
 double stuckNoMoveSeconds = 0;
 const double stuckTimeoutSeconds = 5.0;
@@ -138,6 +144,8 @@ public void Main (string argument, UpdateType updateSource)
             Move();
         else
             ResetMovement();
+
+        UpdatePathRunner();
         runtime++;
     }
     else
@@ -168,6 +176,8 @@ void WriteEcho()
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
+    if (pathMode)
+        sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}");
     sb.AppendLine("Faceforward = look toward target");
     sb.AppendLine("Faceup = align up to gravity-up (or current up in space)");
 
@@ -364,6 +374,9 @@ void RemoteCommand (string command)
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
             retryCurrentLane = false;
+            pathMode = false;
+            pathRecords.Clear();
+            pathIndex = 0;
             activeMaxSpeed = 0;
             SetDrills(false);
             ResetMovement();
@@ -386,6 +399,15 @@ void RemoteCommand (string command)
         case "nexthole":
             NextHole();
             break;
+        case "pathstart":
+            StartPathFromTimer();
+            break;
+        case "pathstop":
+            pathMode = false;
+            pathRecords.Clear();
+            pathIndex = 0;
+            Echo("Path mode stopped.");
+            break;
         case "toffreset":
             TOFFR = 0;
             TOFFU = 0;
@@ -399,6 +421,157 @@ void RemoteCommand (string command)
                 StartAreaMining(trimmed);
             break;
     }
+}
+
+void UpdatePathRunner()
+{
+    if (!pathMode || pathRecords.Count == 0)
+        return;
+
+    if (miningEnabled)
+        return;
+
+    if (autopilotEnabled && hasTarget)
+    {
+        if (IsAtTargetPose(targetPosition, desiredForward, desiredUp))
+        {
+            autopilotEnabled = false;
+            hasTarget = false;
+            activeMaxSpeed = 0;
+        }
+        return;
+    }
+
+    StartNextPathRecord();
+}
+
+void StartPathFromTimer()
+{
+    List<string> loaded;
+    string timerName;
+    if (!TryLoadPathRecordsFromTimer(out loaded, out timerName))
+    {
+        Echo($"Unable to load path records from timer tag '{pathTimerTag}'.");
+        return;
+    }
+
+    pathRecords = loaded;
+    pathIndex = 0;
+    pathMode = true;
+    Echo($"Loaded {pathRecords.Count} path records from timer '{timerName}'.");
+    StartNextPathRecord();
+}
+
+void StartNextPathRecord()
+{
+    while (pathMode && pathIndex < pathRecords.Count)
+    {
+        string record = pathRecords[pathIndex];
+        pathIndex++;
+        if (ExecutePathRecord(record))
+            return;
+        Echo($"Skipping invalid path record #{pathIndex}.");
+    }
+
+    if (pathMode && pathIndex >= pathRecords.Count)
+    {
+        pathMode = false;
+        Echo("Path execution complete.");
+    }
+}
+
+bool ExecutePathRecord(string rawRecord)
+{
+    if (string.IsNullOrWhiteSpace(rawRecord))
+        return false;
+
+    string record = rawRecord.Trim();
+    if (record.StartsWith("\"") && record.EndsWith("\"") && record.Length >= 2)
+        record = record.Substring(1, record.Length - 2).Trim();
+    if (string.IsNullOrWhiteSpace(record))
+        return false;
+
+    if (record.StartsWith("minearea;", StringComparison.OrdinalIgnoreCase))
+    {
+        StartAreaMining(record);
+        return miningEnabled;
+    }
+
+    if (record.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase) && record.Contains(";"))
+    {
+        StartAreaMining("minearea;" + record);
+        return miningEnabled;
+    }
+
+    if (record.StartsWith("Nav;", StringComparison.OrdinalIgnoreCase))
+    {
+        Vector3D gps;
+        Vector3D forward;
+        Vector3D up;
+        if (!TryParseGpsCommand(record.Substring(4).Trim(), out gps, out forward, out up))
+            return false;
+        targetPosition = gps;
+        desiredForward = forward;
+        desiredUp = up;
+        hasTarget = true;
+        autopilotEnabled = true;
+        return true;
+    }
+
+    if (record.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+    {
+        Vector3D gps;
+        Vector3D forward;
+        Vector3D up;
+        if (!TryParseGpsCommand(record, out gps, out forward, out up))
+            return false;
+        targetPosition = gps;
+        desiredForward = forward;
+        desiredUp = up;
+        hasTarget = true;
+        autopilotEnabled = true;
+        return true;
+    }
+
+    return false;
+}
+
+bool TryLoadPathRecordsFromTimer(out List<string> records, out string timerName)
+{
+    records = new List<string>();
+    timerName = "";
+
+    List<IMyTimerBlock> timers = GetBlocks<IMyTimerBlock>();
+    IMyTimerBlock timer = null;
+    foreach (var t in timers)
+    {
+        if (t == null || string.IsNullOrWhiteSpace(t.CustomName))
+            continue;
+        if (t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            timer = t;
+            break;
+        }
+    }
+    if (timer == null)
+        return false;
+
+    timerName = timer.CustomName;
+    string data = timer.CustomData ?? "";
+    string[] lines = data.Split(new [] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+    foreach (string line in lines)
+    {
+        string rec = line.Trim();
+        if (string.IsNullOrWhiteSpace(rec))
+            continue;
+        if (rec.StartsWith("\"") && rec.EndsWith("\"") && rec.Length >= 2)
+            rec = rec.Substring(1, rec.Length - 2).Trim();
+        if (string.IsNullOrWhiteSpace(rec))
+            continue;
+        records.Add(rec);
+    }
+
+    return records.Count > 0;
 }
 
 void StartSingleLaneMining(string command)
@@ -460,7 +633,7 @@ void StartAreaMining(string command)
     Vector3D rightBottom;
     if (!TryParsePoint(args[1], out leftUpper) || !TryParsePoint(args[2], out rightBottom))
     {
-        Echo("Invalid depth.");
+        Echo("Invalid orientation mode. Use Faceup,Faceforward or ux,uy,uz,fx,fy,fz");
         return;
     }
 
