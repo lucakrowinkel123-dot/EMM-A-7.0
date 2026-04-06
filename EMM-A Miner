@@ -13,7 +13,7 @@
 // clear : clears target and releases controls
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
-// minearea;<gps or x,y,z>;<gps or x,y,z>;depth : run distributed lanes over rectangle
+// minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth : run distributed lanes over rectangle
 // nexthole : skip to the next generated area lane anchor
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
@@ -448,11 +448,11 @@ void StartSingleLaneMining(string command)
 
 void StartAreaMining(string command)
 {
-    // minearea;<gps or x,y,z>;<gps or x,y,z>;depth
+    // minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth
     string[] args = command.Split(';');
-    if (args.Length < 4)
+    if (args.Length < 5)
     {
-        Echo("Usage: minearea;<gps or x,y,z>;<gps or x,y,z>;depth");
+        Echo("Usage: minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth");
         return;
     }
 
@@ -460,29 +460,24 @@ void StartAreaMining(string command)
     Vector3D rightBottom;
     if (!TryParsePoint(args[1], out leftUpper) || !TryParsePoint(args[2], out rightBottom))
     {
-        Echo("Invalid rectangle points. Use GPS:Name:X:Y:Z: or x,y,z");
-        return;
-    }
-
-    double depth;
-    if (!double.TryParse(args[3], out depth) || depth <= 0)
-    {
         Echo("Invalid depth.");
         return;
     }
 
-    Vector3D up = desiredUp;
-    if (up.LengthSquared() < 0.001)
+    Vector3D up;
+    Vector3D forward;
+    if (!TryParseAreaOrientation(args[3], leftUpper, rightBottom, out up, out forward))
     {
-        Vector3D gravity = rc.GetNaturalGravity();
-        up = gravity.LengthSquared() > 0.001 ? Vector3D.Normalize(-gravity) : rc.WorldMatrix.Up;
+        Echo("Invalid orientation mode. Use Faceup,Faceforward or ux,uy,uz,fx,fy,fz");
+        return;
     }
-    up = Vector3D.Normalize(up);
 
-    Vector3D forward = desiredForward;
-    if (forward.LengthSquared() < 0.001)
-        forward = rc.WorldMatrix.Forward;
-    forward = Vector3D.Normalize(forward);
+    double depth;
+    if (!double.TryParse(args[4], out depth) || depth <= 0)
+    {
+        Echo("Invalid depth.");
+        return;
+    }
 
     Vector3D right = Vector3D.Cross(forward, up);
     if (right.LengthSquared() < 0.001)
@@ -514,6 +509,58 @@ void StartAreaMining(string command)
     ResetDepthAutoTracker();
 
     Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
+}
+
+bool TryParseAreaOrientation(string modeText, Vector3D pointA, Vector3D pointB, out Vector3D up, out Vector3D forward)
+{
+    up = Vector3D.Zero;
+    forward = Vector3D.Zero;
+
+    string [] modes = modeText.Split(new [] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+    if (modes.Length == 2)
+    {
+        string upMode = modes[0].Trim();
+        string forwardMode = modes[1].Trim();
+        if (!upMode.Equals("Faceup", StringComparison.OrdinalIgnoreCase) ||
+            !forwardMode.Equals("Faceforward", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        Vector3D gravity = rc.GetNaturalGravity();
+        if (gravity.LengthSquared() > 0.001)
+            up = Vector3D.Normalize(-gravity);
+        else
+            up = rc.WorldMatrix.Up;
+
+        Vector3D toward = pointB - pointA;
+        toward = toward - Vector3D.Dot(toward, up) * up; // flatten into the area plane
+        if (toward.LengthSquared() > 0.001)
+            forward = Vector3D.Normalize(toward);
+        else
+            forward = rc.WorldMatrix.Forward;
+        return true;
+    }
+
+    if (modes.Length == 6)
+    {
+        double ux, uy, uz, fx, fy, fz;
+        if (double.TryParse(modes[0].Trim(), out ux) &&
+            double.TryParse(modes[1].Trim(), out uy) &&
+            double.TryParse(modes[2].Trim(), out uz) &&
+            double.TryParse(modes[3].Trim(), out fx) &&
+            double.TryParse(modes[4].Trim(), out fy) &&
+            double.TryParse(modes[5].Trim(), out fz))
+        {
+            up = new Vector3D(ux, uy, uz);
+            forward = new Vector3D(fx, fy, fz);
+            if (up.LengthSquared() > 0.001)
+                up = Vector3D.Normalize(up);
+            if (forward.LengthSquared() > 0.001)
+                forward = Vector3D.Normalize(forward);
+            return up.LengthSquared() > 0.001 && forward.LengthSquared() > 0.001;
+        }
+    }
+
+    return false;
 }
 
 List<Vector3D> BuildRectangleLaneAnchors(Vector3D leftUpper, Vector3D rightBottom, Vector3D up, Vector3D right, double laneHeight, double laneWidth)
