@@ -1235,6 +1235,9 @@ const double gyroP = 18;
 const double gyroI = 0;
 const double gyroD = 3;
 const double gyroMax = 1000;
+const double gyroErrorDeadbandRad = 0.003; // ~0.17 deg
+const double gyroOutputDeadband = 0.002;
+const double gyroFineDampRangeRad = 0.12; // start damping under ~7 deg total error
 
 class GyroControl
 {
@@ -1361,6 +1364,7 @@ class GyroControl
         // In (pitch, yaw, roll)
         Vector3D error = -GetAngles2(rc.WorldMatrix, forward, up);
         Vector3D angles = new Vector3D(anglePID.Control(error));
+        ApplyFineDamping(error, ref angles);
         ApplyGyroOverride(rc.WorldMatrix, angles);
     }
     /// <summary>
@@ -1371,7 +1375,32 @@ class GyroControl
         // In (pitch, yaw, roll)
         Vector3D error = -GetAngles(rc.WorldMatrix, forward, up);
         Vector3D angles = new Vector3D(anglePID.Control(error));
+        ApplyFineDamping(error, ref angles);
         ApplyGyroOverride(rc.WorldMatrix, angles);
+    }
+
+    void ApplyFineDamping(Vector3D error, ref Vector3D angles)
+    {
+        if (Math.Abs(error.X) < gyroErrorDeadbandRad)
+            angles.X = 0;
+        if (Math.Abs(error.Y) < gyroErrorDeadbandRad)
+            angles.Y = 0;
+        if (Math.Abs(error.Z) < gyroErrorDeadbandRad)
+            angles.Z = 0;
+
+        double errMag = error.Length();
+        if (errMag < gyroFineDampRangeRad)
+        {
+            double s = MathHelper.Clamp(errMag / gyroFineDampRangeRad, 0.2, 1.0);
+            angles *= s;
+        }
+
+        if (Math.Abs(angles.X) < gyroOutputDeadband)
+            angles.X = 0;
+        if (Math.Abs(angles.Y) < gyroOutputDeadband)
+            angles.Y = 0;
+        if (Math.Abs(angles.Z) < gyroOutputDeadband)
+            angles.Z = 0;
     }
     void ApplyGyroOverride (MatrixD current, Vector3D localAngles)
     {
