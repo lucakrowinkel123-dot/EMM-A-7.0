@@ -1,22 +1,25 @@
 
-// Autopilot Test Script
+// Autopilot Script
 
 // ============= Settings ==============
-// Settings are located entirely in Custom Data.
-// Run the script once to generate an initial config.
+// Edit these settings directly in the script.
 // =====================================
 
 // ============= Commands ==============
-// GPS:Name:X:Y:Z:|Ux,Uy,Uz,Fx,Fy,Fz : sets target position and explicit up/forward vectors
-// GPS:Name:X:Y:Z:|Faceup,Faceforward : auto derive up/forward vectors
+// Nav;GPS:Name:X:Y:Z:|Ux,Uy,Uz,Fx,Fy,Fz : sets target position and explicit up/forward vectors
+// Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward : auto derive up/forward vectors
 // stop : disables autopilot and releases controls
 // start : enables autopilot (if a target has been set)
 // clear : clears target and releases controls
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
-// minearea;depth;<gps or x,y,z>;<gps or x,y,z> : run distributed lanes over rectangle
+// minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth : run distributed lanes over rectangle
 // nexthole : skip to the next generated area lane anchor
 // cancelmine : stops mining state machine and turns drills off
+// pathstart : loads records from timer with tag in pathTimerTag and executes row-by-row
+// pathpause : pauses queue and active movement; minearea returns to current anchor and waits
+// pathcontinue : resumes queue advancement after pathpause
+// pathstop : stops path mode and clears remaining queued records
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
@@ -26,7 +29,19 @@
 // TOFFRESET : clears target offset
 // =====================================
 
-Settings settings;
+// ========== Editable Script Settings ==========
+string cockpitName = "Cockpit";
+double maxSpeed = 20;
+double arrivalTolerance = 0.5;
+double orientationToleranceDeg = 2.0;
+UpdateFrequency tickSpeed = UpdateFrequency.Update1;
+double autoDepthNoGainMeters = 2.0;
+double autoDepthExtraCap = 2000.0;
+double TOFFR = 0; // target offset Right (m)
+double TOFFU = -2.5; // target offset Up (m)
+double TOFFF = 0; // target offset Forward (m)
+string pathTimerTag = "Path";
+// =============================================
 
 IMyShipController rc;
 ThrusterControl thrust;
@@ -66,15 +81,15 @@ double lastOreSnapshot = 0;
 double lastOreGainDepth = 0;
 int noOreGainTicks = 0;
 const int noOreGainTickLimit = 20;
-const double autoDepthNoGainMeters = 2.0;
-const double autoDepthExtraCap = 2000.0;
-double TOFFR = 0; // target offset Right (m)
-double TOFFU = -2.5; // target offset Up (m)
-double TOFFF = 0; // target offset Forward (m)
 bool areaMiningMode = false;
 List<Vector3D> areaLaneAnchors = new List<Vector3D>();
 int areaLaneIndex = 0;
 bool retryCurrentLane = false;
+bool pathMode = false;
+bool pathPaused = false;
+bool pathPausedNavResume = false;
+List<string> pathRecords = new List<string>();
+int pathIndex = 0;
 Vector3D stuckSamplePos = Vector3D.Zero;
 double stuckNoMoveSeconds = 0;
 const double stuckTimeoutSeconds = 5.0;
@@ -86,34 +101,31 @@ int runtime = 0;
 
 public Program ()
 {
-    settings = new Settings(Me);
-    settings.Load();
-
     // Prioritize the given cockpit name
-    rc = GetBlock<IMyShipController>(settings.cockpitName.Value, true);
+    rc = GetBlock<IMyShipController>(cockpitName, true);
     if (rc == null) // Second priority cockpit
         rc = GetBlock<IMyCockpit>();
     if (rc == null) // Third priority remote control
         rc = GetBlock<IMyRemoteControl>();
     if (rc == null) // No cockpits found.
-        throw new Exception("No cockpit/remote control found. Set the cockpitName field in settings.");
+        throw new Exception("No cockpit/remote control found. Set the cockpitName field at the top of the script.");
 
-    thrust = new ThrusterControl(rc, settings.tickSpeed.Value, GetBlocks<IMyThrust>());
-    gyros = new GyroControl(rc, settings.tickSpeed.Value, GetBlocks<IMyGyro>());
+    thrust = new ThrusterControl(rc, tickSpeed, GetBlocks<IMyThrust>());
+    gyros = new GyroControl(rc, tickSpeed, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
 
-    if (settings.tickSpeed.Value == UpdateFrequency.Update10)
+    if (tickSpeed == UpdateFrequency.Update10)
         secondsPerTick = 10.0 / 60.0;
-    else if (settings.tickSpeed.Value == UpdateFrequency.Update100)
+    else if (tickSpeed == UpdateFrequency.Update100)
         secondsPerTick = 100.0 / 60.0;
 
-    if (settings.tickSpeed.Value == UpdateFrequency.Update10)
+    if (tickSpeed == UpdateFrequency.Update10)
         echoFrequency = 10;
-    else if (settings.tickSpeed.Value == UpdateFrequency.Update100)
+    else if (tickSpeed == UpdateFrequency.Update100)
         echoFrequency = 1;
 
     Echo("Ready.");
-    Runtime.UpdateFrequency = settings.tickSpeed.Value;
+    Runtime.UpdateFrequency = tickSpeed;
 }
 
 void ResetMovement()
@@ -136,6 +148,8 @@ public void Main (string argument, UpdateType updateSource)
             Move();
         else
             ResetMovement();
+
+        UpdatePathRunner();
         runtime++;
     }
     else
@@ -147,17 +161,17 @@ public void Main (string argument, UpdateType updateSource)
 void WriteEcho()
 {
     StringBuilder sb = new StringBuilder();
-    sb.AppendLine("Autopilot Test Mode");
+    sb.AppendLine("Autopilot Mode");
     sb.AppendLine(autopilotEnabled ? "State: Enabled" : "State: Disabled");
     if (hasTarget)
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
     else
         sb.AppendLine("Target: <none>");
     sb.AppendLine("Command example:");
-    sb.AppendLine("GPS:Site:66288.47:-8270.96:-94039.68:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
+    sb.AppendLine("Nav;GPS:Site:66288.47:-8270.96:-94039.68:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
     sb.AppendLine("dumpgps");
-    sb.AppendLine($"Arrival tolerance: {settings.arrivalTolerance.Value:0.00} m");
-    sb.AppendLine($"Orientation tolerance: {settings.orientationToleranceDeg.Value:0.00} deg");
+    sb.AppendLine($"Arrival tolerance: {arrivalTolerance:0.00} m");
+    sb.AppendLine($"Orientation tolerance: {orientationToleranceDeg:0.00} deg");
     sb.AppendLine($"Mining: {miningState}");
     sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
@@ -166,6 +180,8 @@ void WriteEcho()
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
         sb.AppendLine($"Area lane: {areaLaneIndex + 1}/{areaLaneAnchors.Count}");
+    if (pathMode)
+        sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
     sb.AppendLine("Faceforward = look toward target");
     sb.AppendLine("Faceup = align up to gravity-up (or current up in space)");
 
@@ -178,7 +194,7 @@ void Move ()
     Vector3D worldOffset = GetTargetOffsetWorld();
     Vector3D position = rc.GetPosition() + worldOffset;
     Vector3D toTarget = targetPosition - position;
-    double tolerance = Math.Max(0.05, settings.arrivalTolerance.Value);
+    double tolerance = Math.Max(0.05, arrivalTolerance);
 
     Vector3D forward = desiredForward;
     if (forward == Vector3D.Zero && toTarget.LengthSquared() > 0.001)
@@ -197,7 +213,7 @@ void Move ()
     gyros.FaceVectors(forward, up);
 
     bool atPosition = toTarget.LengthSquared() < tolerance * tolerance;
-    bool aligned = IsOrientationAligned(forward, up, settings.orientationToleranceDeg.Value);
+    bool aligned = IsOrientationAligned(forward, up, orientationToleranceDeg);
     if (atPosition)
     {
         thrust.Reset();
@@ -206,9 +222,9 @@ void Move ()
         return;
     }
 
-    double maxSpeed = activeMaxSpeed > 0 ? activeMaxSpeed : settings.maxSpeed.Value;
+    double maxSpeedNow = activeMaxSpeed > 0 ? activeMaxSpeed : maxSpeed;
     Vector3D rcTarget = targetPosition - worldOffset;
-    thrust.ApplyAccel(thrust.ControlPosition(rcTarget, Vector3D.Zero, maxSpeed));
+    thrust.ApplyAccel(thrust.ControlPosition(rcTarget, Vector3D.Zero, maxSpeedNow));
 }
 
 Vector3D GetTargetOffsetWorld()
@@ -244,11 +260,12 @@ void RemoteCommand (string command)
         return;
 
     string trimmed = command.Trim();
-    if (trimmed.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+    if (trimmed.StartsWith("Nav;", StringComparison.OrdinalIgnoreCase))
     {
-        if (!TryParseGpsCommand(trimmed, out targetPosition, out desiredForward, out desiredUp))
+        string navArgs = trimmed.Substring(4).Trim();
+        if (!TryParseGpsCommand(navArgs, out targetPosition, out desiredForward, out desiredUp))
         {
-            Echo("Invalid GPS command format.");
+            Echo("Invalid Nav command format. Use Nav;GPS:Name:X:Y:Z:|Faceup,Faceforward");
             return;
         }
         hasTarget = true;
@@ -347,7 +364,7 @@ void RemoteCommand (string command)
             Echo("Stopped.");
             break;
         case "start":
-            Runtime.UpdateFrequency = settings.tickSpeed.Value;
+            Runtime.UpdateFrequency = tickSpeed;
             autopilotEnabled = true;
             WriteEcho();
             break;
@@ -361,6 +378,11 @@ void RemoteCommand (string command)
             areaLaneAnchors.Clear();
             areaLaneIndex = 0;
             retryCurrentLane = false;
+            pathMode = false;
+            pathPaused = false;
+            pathPausedNavResume = false;
+            pathRecords.Clear();
+            pathIndex = 0;
             activeMaxSpeed = 0;
             SetDrills(false);
             ResetMovement();
@@ -383,6 +405,61 @@ void RemoteCommand (string command)
         case "nexthole":
             NextHole();
             break;
+        case "pathstart":
+            StartPathFromTimer();
+            break;
+        case "pathpause":
+            if (!pathMode)
+                Echo("Path mode is not active.");
+            else
+            {
+                pathPaused = true;
+                if (miningEnabled)
+                {
+                    SetDrills(false);
+                    retryCurrentLane = true;
+                    miningState = MiningState.Backout;
+                    autopilotEnabled = true; // return to anchor
+                    Echo("Path mode paused. Returning to current anchor.");
+                }
+                else if (autopilotEnabled && hasTarget)
+                {
+                    autopilotEnabled = false; // freeze movement in place
+                    pathPausedNavResume = true;
+                    Echo("Path mode paused. Movement halted.");
+                }
+                else
+                {
+                    Echo("Path mode paused.");
+                }
+            }
+            break;
+        case "pathcontinue":
+            if (!pathMode)
+                Echo("Path mode is not active.");
+            else
+            {
+                pathPaused = false;
+                Echo("Path mode resumed.");
+                if (miningEnabled && hasTarget)
+                    autopilotEnabled = true;
+                else if (pathPausedNavResume && hasTarget)
+                {
+                    autopilotEnabled = true;
+                    pathPausedNavResume = false;
+                }
+                else if (!autopilotEnabled && !miningEnabled)
+                    StartNextPathRecord();
+            }
+            break;
+        case "pathstop":
+            pathMode = false;
+            pathPaused = false;
+            pathPausedNavResume = false;
+            pathRecords.Clear();
+            pathIndex = 0;
+            Echo("Path mode stopped.");
+            break;
         case "toffreset":
             TOFFR = 0;
             TOFFU = 0;
@@ -396,6 +473,161 @@ void RemoteCommand (string command)
                 StartAreaMining(trimmed);
             break;
     }
+}
+
+void UpdatePathRunner()
+{
+    if (!pathMode || pathRecords.Count == 0)
+        return;
+    if (pathPaused)
+        return;
+
+    if (miningEnabled)
+        return;
+
+    if (autopilotEnabled && hasTarget)
+    {
+        if (IsAtTargetPose(targetPosition, desiredForward, desiredUp))
+        {
+            autopilotEnabled = false;
+            hasTarget = false;
+            activeMaxSpeed = 0;
+        }
+        return;
+    }
+
+    StartNextPathRecord();
+}
+
+void StartPathFromTimer()
+{
+    List<string> loaded;
+    string timerName;
+    if (!TryLoadPathRecordsFromTimer(out loaded, out timerName))
+    {
+        Echo($"Unable to load path records from timer tag '{pathTimerTag}'.");
+        return;
+    }
+
+    pathRecords = loaded;
+    pathIndex = 0;
+    pathMode = true;
+    pathPaused = false;
+    pathPausedNavResume = false;
+    Echo($"Loaded {pathRecords.Count} path records from timer '{timerName}'.");
+    StartNextPathRecord();
+}
+
+void StartNextPathRecord()
+{
+    while (pathMode && pathIndex < pathRecords.Count)
+    {
+        string record = pathRecords[pathIndex];
+        pathIndex++;
+        if (ExecutePathRecord(record))
+            return;
+        Echo($"Skipping invalid path record #{pathIndex}.");
+    }
+
+    if (pathMode && pathIndex >= pathRecords.Count)
+    {
+        pathMode = false;
+        Echo("Path execution complete.");
+    }
+}
+
+bool ExecutePathRecord(string rawRecord)
+{
+    if (string.IsNullOrWhiteSpace(rawRecord))
+        return false;
+
+    string record = rawRecord.Trim();
+    if (record.StartsWith("\"") && record.EndsWith("\"") && record.Length >= 2)
+        record = record.Substring(1, record.Length - 2).Trim();
+    if (string.IsNullOrWhiteSpace(record))
+        return false;
+
+    if (record.StartsWith("minearea;", StringComparison.OrdinalIgnoreCase))
+    {
+        StartAreaMining(record);
+        return miningEnabled;
+    }
+
+    if (record.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase) && record.Contains(";"))
+    {
+        StartAreaMining("minearea;" + record);
+        return miningEnabled;
+    }
+
+    if (record.StartsWith("Nav;", StringComparison.OrdinalIgnoreCase))
+    {
+        Vector3D gps;
+        Vector3D forward;
+        Vector3D up;
+        if (!TryParseGpsCommand(record.Substring(4).Trim(), out gps, out forward, out up))
+            return false;
+        targetPosition = gps;
+        desiredForward = forward;
+        desiredUp = up;
+        hasTarget = true;
+        autopilotEnabled = true;
+        return true;
+    }
+
+    if (record.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+    {
+        Vector3D gps;
+        Vector3D forward;
+        Vector3D up;
+        if (!TryParseGpsCommand(record, out gps, out forward, out up))
+            return false;
+        targetPosition = gps;
+        desiredForward = forward;
+        desiredUp = up;
+        hasTarget = true;
+        autopilotEnabled = true;
+        return true;
+    }
+
+    return false;
+}
+
+bool TryLoadPathRecordsFromTimer(out List<string> records, out string timerName)
+{
+    records = new List<string>();
+    timerName = "";
+
+    List<IMyTimerBlock> timers = GetBlocks<IMyTimerBlock>();
+    IMyTimerBlock timer = null;
+    foreach (var t in timers)
+    {
+        if (t == null || string.IsNullOrWhiteSpace(t.CustomName))
+            continue;
+        if (t.CustomName.IndexOf(pathTimerTag, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            timer = t;
+            break;
+        }
+    }
+    if (timer == null)
+        return false;
+
+    timerName = timer.CustomName;
+    string data = timer.CustomData ?? "";
+    string[] lines = data.Split(new [] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+    foreach (string line in lines)
+    {
+        string rec = line.Trim();
+        if (string.IsNullOrWhiteSpace(rec))
+            continue;
+        if (rec.StartsWith("\"") && rec.EndsWith("\"") && rec.Length >= 2)
+            rec = rec.Substring(1, rec.Length - 2).Trim();
+        if (string.IsNullOrWhiteSpace(rec))
+            continue;
+        records.Add(rec);
+    }
+
+    return records.Count > 0;
 }
 
 void StartSingleLaneMining(string command)
@@ -445,41 +677,36 @@ void StartSingleLaneMining(string command)
 
 void StartAreaMining(string command)
 {
-    // minearea;depth;<gps or x,y,z>;<gps or x,y,z>
+    // minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth
     string[] args = command.Split(';');
-    if (args.Length < 4)
+    if (args.Length < 5)
     {
-        Echo("Usage: minearea;depth;<gps or x,y,z>;<gps or x,y,z>");
-        return;
-    }
-
-    double depth;
-    if (!double.TryParse(args[1], out depth) || depth <= 0)
-    {
-        Echo("Invalid depth.");
+        Echo("Usage: minearea;<gps or x,y,z>;<gps or x,y,z>;Faceup,Faceforward;depth");
         return;
     }
 
     Vector3D leftUpper;
     Vector3D rightBottom;
-    if (!TryParsePoint(args[2], out leftUpper) || !TryParsePoint(args[3], out rightBottom))
+    if (!TryParsePoint(args[1], out leftUpper) || !TryParsePoint(args[2], out rightBottom))
     {
         Echo("Invalid rectangle points. Use GPS:Name:X:Y:Z: or x,y,z");
         return;
     }
 
-    Vector3D up = desiredUp;
-    if (up.LengthSquared() < 0.001)
+    Vector3D up;
+    Vector3D forward;
+    if (!TryParseAreaOrientation(args[3], leftUpper, rightBottom, out up, out forward))
     {
-        Vector3D gravity = rc.GetNaturalGravity();
-        up = gravity.LengthSquared() > 0.001 ? Vector3D.Normalize(-gravity) : rc.WorldMatrix.Up;
+        Echo("Invalid orientation mode. Use Faceup,Faceforward or ux,uy,uz,fx,fy,fz");
+        return;
     }
-    up = Vector3D.Normalize(up);
 
-    Vector3D forward = desiredForward;
-    if (forward.LengthSquared() < 0.001)
-        forward = rc.WorldMatrix.Forward;
-    forward = Vector3D.Normalize(forward);
+    double depth;
+    if (!double.TryParse(args[4], out depth) || depth <= 0)
+    {
+        Echo("Invalid depth.");
+        return;
+    }
 
     Vector3D right = Vector3D.Cross(forward, up);
     if (right.LengthSquared() < 0.001)
@@ -511,6 +738,58 @@ void StartAreaMining(string command)
     ResetDepthAutoTracker();
 
     Echo($"Area mining started. Lanes={areaLaneAnchors.Count}, depth={laneDepth:0.00}m");
+}
+
+bool TryParseAreaOrientation(string modeText, Vector3D pointA, Vector3D pointB, out Vector3D up, out Vector3D forward)
+{
+    up = Vector3D.Zero;
+    forward = Vector3D.Zero;
+
+    string [] modes = modeText.Split(new [] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+    if (modes.Length == 2)
+    {
+        string upMode = modes[0].Trim();
+        string forwardMode = modes[1].Trim();
+        if (!upMode.Equals("Faceup", StringComparison.OrdinalIgnoreCase) ||
+            !forwardMode.Equals("Faceforward", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        Vector3D gravity = rc.GetNaturalGravity();
+        if (gravity.LengthSquared() > 0.001)
+            up = Vector3D.Normalize(-gravity);
+        else
+            up = rc.WorldMatrix.Up;
+
+        Vector3D toward = pointB - pointA;
+        toward = toward - Vector3D.Dot(toward, up) * up; // flatten into the area plane
+        if (toward.LengthSquared() > 0.001)
+            forward = Vector3D.Normalize(toward);
+        else
+            forward = rc.WorldMatrix.Forward;
+        return true;
+    }
+
+    if (modes.Length == 6)
+    {
+        double ux, uy, uz, fx, fy, fz;
+        if (double.TryParse(modes[0].Trim(), out ux) &&
+            double.TryParse(modes[1].Trim(), out uy) &&
+            double.TryParse(modes[2].Trim(), out uz) &&
+            double.TryParse(modes[3].Trim(), out fx) &&
+            double.TryParse(modes[4].Trim(), out fy) &&
+            double.TryParse(modes[5].Trim(), out fz))
+        {
+            up = new Vector3D(ux, uy, uz);
+            forward = new Vector3D(fx, fy, fz);
+            if (up.LengthSquared() > 0.001)
+                up = Vector3D.Normalize(up);
+            if (forward.LengthSquared() > 0.001)
+                forward = Vector3D.Normalize(forward);
+            return up.LengthSquared() > 0.001 && forward.LengthSquared() > 0.001;
+        }
+    }
+
+    return false;
 }
 
 List<Vector3D> BuildRectangleLaneAnchors(Vector3D leftUpper, Vector3D rightBottom, Vector3D up, Vector3D right, double laneHeight, double laneWidth)
@@ -633,6 +912,12 @@ void UpdateMiningState()
             {
                 if (!retryCurrentLane)
                     SetDrills(false);
+                if (pathMode && pathPaused)
+                {
+                    autopilotEnabled = false;
+                    activeMaxSpeed = 0;
+                    return;
+                }
                 if (retryCurrentLane)
                 {
                     retryCurrentLane = false;
@@ -795,13 +1080,13 @@ void NextHole()
 
 bool IsAtTargetPosition(Vector3D target)
 {
-    double tolerance = Math.Max(0.05, settings.arrivalTolerance.Value);
+    double tolerance = Math.Max(0.05, arrivalTolerance);
     return Vector3D.DistanceSquared(rc.GetPosition() + GetTargetOffsetWorld(), target) < tolerance * tolerance;
 }
 
 bool IsAtTargetPose(Vector3D target, Vector3D forward, Vector3D up)
 {
-    return IsAtTargetPosition(target) && IsOrientationAligned(forward, up, settings.orientationToleranceDeg.Value);
+    return IsAtTargetPosition(target) && IsOrientationAligned(forward, up, orientationToleranceDeg);
 }
 
 void SetDrills(bool enabled)
@@ -950,6 +1235,9 @@ const double gyroP = 18;
 const double gyroI = 0;
 const double gyroD = 3;
 const double gyroMax = 1000;
+const double gyroErrorDeadbandRad = 0.003; // ~0.17 deg
+const double gyroOutputDeadband = 0.002;
+const double gyroFineDampRangeRad = 0.12; // start damping under ~7 deg total error
 
 class GyroControl
 {
@@ -1076,6 +1364,7 @@ class GyroControl
         // In (pitch, yaw, roll)
         Vector3D error = -GetAngles2(rc.WorldMatrix, forward, up);
         Vector3D angles = new Vector3D(anglePID.Control(error));
+        ApplyFineDamping(error, ref angles);
         ApplyGyroOverride(rc.WorldMatrix, angles);
     }
     /// <summary>
@@ -1086,7 +1375,32 @@ class GyroControl
         // In (pitch, yaw, roll)
         Vector3D error = -GetAngles(rc.WorldMatrix, forward, up);
         Vector3D angles = new Vector3D(anglePID.Control(error));
+        ApplyFineDamping(error, ref angles);
         ApplyGyroOverride(rc.WorldMatrix, angles);
+    }
+
+    void ApplyFineDamping(Vector3D error, ref Vector3D angles)
+    {
+        if (Math.Abs(error.X) < gyroErrorDeadbandRad)
+            angles.X = 0;
+        if (Math.Abs(error.Y) < gyroErrorDeadbandRad)
+            angles.Y = 0;
+        if (Math.Abs(error.Z) < gyroErrorDeadbandRad)
+            angles.Z = 0;
+
+        double errMag = error.Length();
+        if (errMag < gyroFineDampRangeRad)
+        {
+            double s = MathHelper.Clamp(errMag / gyroFineDampRangeRad, 0.2, 1.0);
+            angles *= s;
+        }
+
+        if (Math.Abs(angles.X) < gyroOutputDeadband)
+            angles.X = 0;
+        if (Math.Abs(angles.Y) < gyroOutputDeadband)
+            angles.Y = 0;
+        if (Math.Abs(angles.Z) < gyroOutputDeadband)
+            angles.Z = 0;
     }
     void ApplyGyroOverride (MatrixD current, Vector3D localAngles)
     {
@@ -1132,185 +1446,6 @@ class GyroControl
     public static Vector3D VectorRejection (Vector3D value, Vector3D guide)
     {
         return value - VectorPojection(value, guide);
-    }
-}
-
-public abstract class IniValue<T>
-{
-    private readonly string comment;
-    protected readonly MyIniKey key;
-    public IniValue(string section, string key, T defaultValue = default(T), string comment = null)
-    {
-        this.key = new MyIniKey(section, key);
-        value = defaultValue;
-        this.comment = comment;
-    }
-
-    protected T value;
-    public T Value
-    {
-        get
-        {
-            return value;
-        }
-    }
-
-    public void Load (MyIni ini)
-    {
-        if (!TryGetValue(ini.Get(key), out value))
-            throw new IniMissingException(key.Name);
-    }
-
-    public void Save (MyIni ini)
-    {
-        Set(ini);
-        ini.SetComment(key, comment);
-    }
-
-    protected abstract void Set(MyIni ini);
-
-    protected abstract bool TryGetValue (MyIniValue storage, out T value);
-
-    public override string ToString ()
-    {
-        return value.ToString();
-    }
-
-    public override bool Equals (object obj)
-    {
-        IniValue<T> value = obj as IniValue<T>;
-        return value != null &&
-               EqualityComparer<T>.Default.Equals(this.value, value.value);
-    }
-
-    public override int GetHashCode ()
-    {
-        return -1584136870 + EqualityComparer<T>.Default.GetHashCode(value);
-    }
-}
-
-public class IniValueBool : IniValue<bool>
-{
-    public IniValueBool (string section, string key, bool defaultValue = false, string comment = null) : base(section, key, defaultValue, comment) { }
-    protected override void Set (MyIni ini)
-    {
-        ini.Set(key, value);
-    }
-    protected override bool TryGetValue (MyIniValue storage, out bool value)
-    {
-        return storage.TryGetBoolean(out value);
-    }
-}
-
-public class IniValueString : IniValue<string>
-{
-    public IniValueString (string section, string key, string defaultValue = null, string comment = null) : base(section, key, defaultValue, comment) { }
-    protected override void Set (MyIni ini)
-    {
-        ini.Set(key, value);
-    }
-    protected override bool TryGetValue (MyIniValue storage, out string value)
-    {
-        return storage.TryGetString(out value);
-    }
-}
-
-public class IniValueVector3D : IniValue<Vector3D>
-{
-    public IniValueVector3D (string section, string key, Vector3D defaultValue = default(Vector3D), string comment = null) : base(section, key, defaultValue, comment) { }
-    protected override void Set (MyIni ini)
-    {
-        ini.Set(key, $"{value.X} {value.Y} {value.Z}");
-    }
-    protected override bool TryGetValue (MyIniValue storage, out Vector3D value)
-    {
-        value = new Vector3D();
-        string temp;
-        if (!storage.TryGetString(out temp))
-            return false;
-        string [] args = temp.Split(new [] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-        if (args.Length != 3)
-            return false;
-        if (!double.TryParse(args [0], out value.X))
-            return false;
-        if (!double.TryParse(args [1], out value.Y))
-            return false;
-        return double.TryParse(args [2], out value.Z);
-    }
-}
-
-public class IniValueEnum<T> : IniValue<T> where T : struct, IComparable
-{
-    public IniValueEnum (string section, string key, T defaultValue = default(T), string comment = null) : base(section, key, defaultValue, comment) { }
-    protected override void Set (MyIni ini)
-    {
-        ini.Set(key, value.ToString());
-    }
-
-    protected override bool TryGetValue (MyIniValue storage, out T value)
-    {
-        value = default(T);
-        string temp;
-        if (!storage.TryGetString(out temp))
-            return false;
-        return Enum.TryParse<T>(temp, out value);
-    }
-}
-
-public class IniValueInt : IniValue<int>
-{
-    public IniValueInt (string section, string key, int defaultValue = 0, string comment = null) : base(section, key, defaultValue, comment) { }
-    protected override void Set (MyIni ini)
-    {
-        ini.Set(key, value);
-    }
-    protected override bool TryGetValue (MyIniValue storage, out int value)
-    {
-        return storage.TryGetInt32(out value);
-    }
-}
-
-public class IniValueDouble : IniValue<double>
-{
-    public IniValueDouble (string section, string key, double defaultValue = 0, string comment = null) : base(section, key, defaultValue, comment) { }
-
-    protected override void Set (MyIni ini)
-    {
-        ini.Set(key, value);
-    }
-
-    protected override bool TryGetValue (MyIniValue storage, out double value)
-    {
-        return storage.TryGetDouble(out value);
-    }
-}
-
-public class IniMissingException : IniParseException
-{
-    public IniMissingException (string id)
-        : base("Value for '" + id + "' is missing or invalid")
-    {
-    }
-
-    public IniMissingException (string id, Exception innerException)
-        : base("Value for '" + id + "' is missing or invalid", innerException)
-    {
-    }
-}
-
-public class IniParseException : Exception
-{
-    private const string error = "Failed to parse CustomData settings.\n";
-    public IniParseException () : base(error)
-    {
-    }
-
-    public IniParseException (string message) : base(error + message)
-    {
-    }
-
-    public IniParseException (string message, Exception innerException) : base(error + message, innerException)
-    {
     }
 }
 
@@ -1439,85 +1574,6 @@ public class VectorPID
         Z.Reset();
     }
 }
-
-public class Settings
-{
-    private readonly IMyProgrammableBlock Me;
-    private readonly MyIni ini = new MyIni();
-    private const string section = "Autopilot";
-    private bool init = false;
-
-    public IniValueString cockpitName = new IniValueString(section, "cockpitName", "Cockpit",
-        "\n The name of the cockpit in the ship.If this cockpit is not" +
-        "\n found, the script will attempt to find one on its own.");
-    public IniValueDouble maxSpeed = new IniValueDouble(section, "maxSpeed", 20,
-        "\n The maximum speed the ship can use when correcting to a GPS target.");
-    public IniValueDouble arrivalTolerance = new IniValueDouble(section, "arrivalTolerance", 0.5,
-        "\n Distance in meters at which the target is considered reached.");
-    public IniValueDouble orientationToleranceDeg = new IniValueDouble(section, "orientationToleranceDeg", 2.0,
-        "\n Angle in degrees used to consider orientation aligned at target.");
-    public IniValueEnum<UpdateFrequency> tickSpeed = new IniValueEnum<UpdateFrequency>(section, "tickSpeed", UpdateFrequency.Update1,
-        "\n This is the frequency that the script is running at. If you are" +
-        "\n experiencing lag because of this script, try decreasing this value." +
-        "\n Update1 : Runs the script every tick" +
-        "\n Update10 : Runs the script every 10th tick" +
-        "\n Update100 : Runs the script every 100th tick");
-
-    public Settings (IMyProgrammableBlock me)
-    {
-        Me = me;
-    }
-
-    public void Load ()
-    {
-        if (!string.IsNullOrWhiteSpace(Me.CustomData))
-        {
-            MyIniParseResult result;
-            if (!ini.TryParse(Me.CustomData, out result))
-                throw new IniParseException(result.ToString());
-
-            if (ini.ContainsSection(section))
-            {
-                cockpitName.Load(ini);
-                maxSpeed.Load(ini);
-                arrivalTolerance.Load(ini);
-                orientationToleranceDeg.Load(ini);
-                tickSpeed.Load(ini);
-                init = true;
-                return;
-            }
-        }
-
-
-        SaveAll();
-        throw new Exception("\n\nSettings file has been generated in Custom Data.\nThis is NOT an error.\nRecompile the script once you ready.\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
-    }
-
-    public void Save ()
-    {
-        if (!init)
-            return;
-        MyIniParseResult result;
-        if (!ini.TryParse(Me.CustomData, out result))
-            throw new IniParseException(result.ToString());
-        SaveAll();
-    }
-
-    private void SaveAll()
-    {
-        cockpitName.Save(ini);
-        maxSpeed.Save(ini);
-        arrivalTolerance.Save(ini);
-        orientationToleranceDeg.Save(ini);
-        tickSpeed.Save(ini);
-        ini.SetSectionComment(section,
-            " GPS Autopilot Test Script" +
-            "\n If you edit this configuration manually, you must recompile the" +
-            "\n script afterwards or you could lose the changes.");
-        Me.CustomData = ini.ToString();
-    }
-}
-
 
 const double thrustP = 3;
 const double thrustI = 2;
